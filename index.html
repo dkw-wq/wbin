@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC 监控台</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1e1e1e; color: #fff; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+        .container { display: flex; gap: 20px; max-width: 1200px; width: 100%; }
+        .video-wrapper {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            border: 2px solid #444;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #000;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        canvas {
+            pointer-events: none;
+        }
+        .panel { flex: 1; background: #2d2d2d; padding: 20px; border-radius: 8px; border: 1px solid #444; }
+        .status { padding: 10px; margin-bottom: 10px; border-radius: 4px; font-weight: bold; text-align: center; }
+        .status.disconnected { background: #ff4757; }
+        .status.connected { background: #2ed573; color: #000; }
+        .highlight { color: #00a8ff; font-size: 1.2em; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <h2>树莓派 WebRTC 实时监控终端</h2>
+
+    <div class="container">
+        <div class="video-wrapper">
+            <video id="remoteVideo" autoplay playsinline muted></video>
+            <canvas id="faceCanvas"></canvas>
+        </div>
+
+        <div class="panel">
+            <div id="wsStatus" class="status disconnected">WebSocket: 离线</div>
+            <div id="webrtcStatus" class="status disconnected">WebRTC: 离线</div>
+            
+            <h3>Data Channel</h3>
+            <p>CPU 温度: <span id="cpuTemp" class="highlight">等待数据...</span></p>
+            <p>人脸检测: <span id="faceCount" class="highlight">等待数据...</span></p>
+            
+            <button onclick="sendControlCmd()" style="margin-top: 20px; padding: 10px 20px; background: #00a8ff; border: none; color: white; border-radius: 4px; cursor: pointer;">
+                向树莓派发送指令 (Data Channel)
+            </button>
+        </div>
+    </div>
+
+<script>
+    const WS_URL = 'ws://10.95.133.17:8443';
+    
+    let ws;
+    let pc;
+    let dataChannel;
+
+    const videoEl = document.getElementById('remoteVideo');
+    const wsStatusEl = document.getElementById('wsStatus');
+    const webrtcStatusEl = document.getElementById('webrtcStatus');
+    const cpuTempEl = document.getElementById('cpuTemp');
+    const faceCountEl = document.getElementById('faceCount');
+    const faceCanvas = document.getElementById('faceCanvas');
+    const ctx = faceCanvas.getContext('2d');
+
+    // Canvas face box drawing
+    function resizeCanvas() {
+        faceCanvas.width = videoEl.clientWidth || 640;
+        faceCanvas.height = videoEl.clientHeight || 480;
+    }
+    videoEl.addEventListener('loadedmetadata', resizeCanvas);
+    videoEl.addEventListener('resize', resizeCanvas);
+
+    function drawFaceBoxes(boxes) {
+        ctx.clearRect(0, 0, faceCanvas.width, faceCanvas.height);
+        if (!boxes.length) return;
+
+        const scaleX = faceCanvas.width / 640;
+        const scaleY = faceCanvas.height / 480;
+
+        ctx.strokeStyle = '#00ff66';
+        ctx.lineWidth = 1.5;
+        ctx.shadowBlur = 6;
+
+        for (const box of boxes) {
+            const [x1, y1, x2, y2] = box;
+            ctx.strokeRect(x1 * scaleX, y1 * scaleY,
+                           (x2 - x1) * scaleX, (y2 - y1) * scaleY);
+        }
+        ctx.shadowBlur = 0;
+    }
+
+    // 初始化 WebSocket 信令
+    function initWebSocket() {
+        ws = new WebSocket(WS_URL);
+        
+        ws.onopen = () => {
+            wsStatusEl.textContent = 'WebSocket: 已连接';
+            wsStatusEl.className = 'status connected';
+            initWebRTC(); // WS 连接成功后初始化 WebRTC
+            // 通知树莓派可以开始 WebRTC 协商
+            ws.send(JSON.stringify({type: "request_offer"}));
+        };
+
+        ws.onclose = () => {
+            wsStatusEl.textContent = 'WebSocket: 已断开';
+            wsStatusEl.className = 'status disconnected';
+            setTimeout(initWebSocket, 2000); // 断线重连
+        };
+
+        ws.onmessage = async (event) => {
+            const msg = JSON.parse(event.data);
+            
+            // 1. 收到树莓派发来的 Offer
+            if (msg.sdp && msg.sdp.type === 'offer') {
+                console.log("收到 Offer, 准备生成 Answer...");
+                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                
+                // 把 Answer 发回给树莓派
+                ws.send(JSON.stringify({ sdp: pc.localDescription }));
+            } 
+            // 2. 收到树莓派发来的 ICE 候选者
+            else if (msg.ice) {
+                console.log("收到 ICE Candidate");
+                await pc.addIceCandidate(new RTCIceCandidate({
+                    candidate: msg.ice.candidate,
+                    sdpMLineIndex: msg.ice.sdpMLineIndex
+                }));
+            }
+        };
+    }
+
+    // 初始化 WebRTC
+    function initWebRTC() {
+        pc = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+
+        // 监听 ICE 候选者，发送给树莓派
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                ws.send(JSON.stringify({
+                    ice: {
+                        candidate: event.candidate.candidate,
+                        sdpMLineIndex: event.candidate.sdpMLineIndex
+                    }
+                }));
+            }
+        };
+
+        // 监听连接状态
+        pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'connected') {
+                webrtcStatusEl.textContent = 'WebRTC: 已连接 ';
+                webrtcStatusEl.className = 'status connected';
+            }
+        };
+
+        // 监听 Data Channel (接收 CPU 温度)
+        pc.ondatachannel = (event) => {
+            dataChannel = event.channel;
+            console.log("Data Channel 建立:", dataChannel.label);
+            
+            dataChannel.onmessage = (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    if (data.type === 'temperature') {
+                        cpuTempEl.textContent = data.value + ' °C';
+                    } else if (data.type === 'faces') {
+                        // Update face count
+                        faceCountEl.textContent = data.count + ' 人';
+                        faceCountEl.style.color = data.count > 0 ? '#2ed573' : '#2ed573';
+
+                        // Draw bounding boxes on canvas
+                        drawFaceBoxes(data.boxes || []);
+                    }
+                } catch(err) {
+                    console.log("收到非 JSON 文本消息:", e.data);
+                }
+            };
+        };
+
+        // 监听视频流接入
+        pc.ontrack = (event) => {
+            if (event.track.kind === 'video') {
+                videoEl.srcObject = event.streams[0];
+            }
+        };
+    }
+
+    // 通过 Data Channel 向树莓派发送指令
+    function sendControlCmd() {
+        if (dataChannel && dataChannel.readyState === 'open') {
+            const cmd = "light_on";
+            dataChannel.send(cmd);
+            console.log("发送指令:", cmd);
+            alert("已发送指令: " + cmd + "\n去树莓派终端看看有没有打印 【get command】: light_on");
+        } else {
+            alert("Data Channel 尚未就绪！");
+        }
+    }
+
+    // 启动流程
+    initWebSocket();
+
+</script>
+</body>
+</html>
